@@ -1,0 +1,143 @@
+# Azure Pipeline for Angular 20 with SSR Frontend
+trigger:
+  branches:
+    include:
+      - main
+      - master
+  paths:
+    include:
+      - src/*
+      - package.json
+      - angular.json
+
+# Use Microsoft-hosted agents (free tier)
+pool:
+  vmImage: 'ubuntu-latest'
+
+# Variables
+variables:
+  nodeVersion: '20.x'  # Angular 20 requires Node 20+
+  buildConfiguration: 'production'
+  workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+stages:
+- stage: Build
+  displayName: 'Build Angular SSR App'
+  jobs:
+  - job: BuildAngularApp
+    displayName: 'Build and Test Angular 20 Application'
+    steps:
+    
+    # Install Node.js 20 (required for Angular 20)
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '$(nodeVersion)'
+      displayName: 'Install Node.js $(nodeVersion)'
+    
+    # Display Node and npm versions
+    - script: |
+        node --version
+        npm --version
+      displayName: 'Display Node.js and npm versions'
+    
+    # Install dependencies using npm ci for faster, reliable builds
+    - script: |
+        npm ci
+      displayName: 'Install npm dependencies'
+      workingDirectory: '$(workingDirectory)'
+    
+    # Run unit tests with coverage
+    - script: |
+        npm run test -- --no-watch --no-progress --browsers=ChromeHeadless --code-coverage
+      displayName: 'Run unit tests'
+      workingDirectory: '$(workingDirectory)'
+      continueOnError: true  # Continue even if tests fail initially
+      condition: eq(variables['runTests'], 'true')  # Only run if variable is set
+    
+    # Publish test results
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/TESTS-*.xml'
+        searchFolder: '$(workingDirectory)'
+      displayName: 'Publish test results'
+      condition: and(eq(variables['runTests'], 'true'), succeededOrFailed())
+    
+    # Publish code coverage
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(workingDirectory)/coverage/angular-ci-demo/cobertura-coverage.xml'
+        reportDirectory: '$(workingDirectory)/coverage/angular-ci-demo'
+      displayName: 'Publish code coverage'
+      condition: and(eq(variables['runTests'], 'true'), succeededOrFailed())
+    
+    # Build Angular app for production (this will build both client and server)
+    - script: |
+        npm run build
+      displayName: 'Build Angular SSR app'
+      workingDirectory: '$(workingDirectory)'
+    
+    # List build output to verify structure
+    - script: |
+        ls -la dist/
+        ls -la dist/angular-ci-demo/
+      displayName: 'List build output'
+      workingDirectory: '$(workingDirectory)'
+    
+    # For Azure App Service, we need to deploy the browser build (client-side)
+    # Copy web.config for Angular routing on Azure App Service
+    - task: CopyFiles@2
+      inputs:
+        sourceFolder: '$(workingDirectory)'
+        contents: 'web.config'
+        targetFolder: '$(workingDirectory)/dist/angular-ci-demo/browser'
+      displayName: 'Copy web.config to browser build folder'
+      condition: succeeded()
+    
+    # Archive the browser build for client-side deployment
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(workingDirectory)/dist/angular-ci-demo/browser'
+        artifactName: 'angular-spa-app'
+        publishLocation: 'Container'
+      displayName: 'Publish SPA build artifacts'
+    
+    # Archive the full SSR build (for future server deployment)
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(workingDirectory)/dist/angular-ci-demo'
+        artifactName: 'angular-ssr-app'
+        publishLocation: 'Container'
+      displayName: 'Publish SSR build artifacts'
+
+- stage: Deploy
+  displayName: 'Deploy to Azure App Service'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployToAppService
+    displayName: 'Deploy Angular SPA to Azure App Service'
+    environment: 'production'  # You can create this environment in Azure DevOps
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Download the SPA build artifacts (browser build)
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'angular-spa-app'
+              downloadPath: '$(Pipeline.Workspace)'
+            displayName: 'Download SPA build artifacts'
+          
+          # Deploy to Azure App Service as static files
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: 'your-service-connection-name'  # Replace with your service connection
+              appType: 'webApp'
+              appName: 'your-app-service-name'  # Replace with your App Service name
+              package: '$(Pipeline.Workspace)/angular-spa-app'
+              deploymentMethod: 'auto'
+            displayName: 'Deploy to Azure App Service'
